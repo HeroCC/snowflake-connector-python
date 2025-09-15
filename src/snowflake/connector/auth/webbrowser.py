@@ -2,22 +2,14 @@
 from __future__ import annotations
 
 import base64
-from io import UnsupportedOperation
 import json
 import logging
 import os
 import secrets
 import select
 import socket
-import sys
 import time
 import webbrowser
-from concurrent.futures import (
-    ThreadPoolExecutor,
-    as_completed,
-    CancelledError,
-    TimeoutError,
-)
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
@@ -181,67 +173,31 @@ class AuthByWebBrowser(AuthByPlugin):
 
             logger.debug("step 2: open a browser")
             print(f"Going to open: {sso_url} to authenticate...")
-            browser_opened = self._webbrowser.open_new(sso_url)
-
-            def server_task():
-                self._receive_saml_token(conn, socket_connection)
-                return "server-success"
-
-            def input_task():
-                if not browser_opened:
-                    print(
-                        "We were unable to open a browser window for you, "
-                        "please open the url above manually then paste the "
-                        "URL you are redirected to into the terminal."
-                    )
-                    try:
-                        url = input("Enter the URL the SSO URL redirected you to: ")
-                        self._process_get_url(url)
-                        return "input-success"
-                    except (UnsupportedOperation, EOFError, KeyboardInterrupt):
-                        pass
-                    except CancelledError:
-                        print(
-                            "Authentication completed via browser - input no longer needed."
-                        )
-                        pass
-                    return "input-failed"
-
-            logger.debug("step 3: waiting for SAML token")
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                futures = []
-
-                # Always expose a server
-                futures.append(executor.submit(server_task))
-
-                # Submit input task only if browser failed and input is available
-                if not browser_opened and sys.stdin.isatty():
-                    futures.append(executor.submit(input_task))
-
-                try:
-                    for future in as_completed(futures, timeout=120):
-                        result = future.result()
-                        if result and self._token:
-                            # We have a token, cancel the other task
-                            for f in futures:
-                                f.cancel()
-                            break
-                except TimeoutError:
-                    logger.debug("Authentication timed out")
-                except Exception as e:
-                    logger.debug(f"Exception during authentication: {e}")
-
-            if not self._token:
-                self._handle_failure(
-                    conn=conn,
-                    ret={
-                        "code": ER_UNABLE_TO_OPEN_BROWSER,
-                        "message": (
-                            "Authentication timeout or no valid token received"
-                        ),
-                    },
+            if not self._webbrowser.open_new(sso_url):
+                print(
+                    "We were unable to open a browser window for you, "
+                    "please open the url above manually then paste the "
+                    "URL you are redirected to into the terminal."
                 )
-                return
+                url = input("Enter the URL the SSO URL redirected you to: ")
+                self._process_get_url(url)
+                if not self._token:
+                    # Input contained no token, either URL was incorrectly pasted,
+                    # empty or just wrong
+                    self._handle_failure(
+                        conn=conn,
+                        ret={
+                            "code": ER_UNABLE_TO_OPEN_BROWSER,
+                            "message": (
+                                "Unable to open a browser in this environment and "
+                                "SSO URL contained no token"
+                            ),
+                        },
+                    )
+                    return
+            else:
+                logger.debug("step 3: accept SAML token")
+                self._receive_saml_token(conn, socket_connection)
         finally:
             socket_connection.close()
 

@@ -10,6 +10,7 @@ import secrets
 import select
 import socket
 import sys
+import threading
 import time
 import webbrowser
 from concurrent.futures import (
@@ -181,55 +182,29 @@ class AuthByWebBrowser(AuthByPlugin):
 
             logger.debug("step 2: open a browser")
             print(f"Going to open: {sso_url} to authenticate...")
-            browser_opened = self._webbrowser.open_new(sso_url)
+            browser_opened = False  # self._webbrowser.open_new(sso_url)
 
-            def server_task():
-                self._receive_saml_token(conn, socket_connection)
-                return "server-success"
-
-            def input_task():
-                if not browser_opened:
+            logger.debug("step 3: waiting for SAML token")
+            if not browser_opened:
+                if IS_WINDOWS:
+                    # This is unlikely -- if we're on Windows there probably is a browser
                     print(
                         "We were unable to open a browser window for you, "
                         "please open the url above manually then paste the "
                         "URL you are redirected to into the terminal."
                     )
-                    try:
-                        url = input("Enter the URL the SSO URL redirected you to: ")
-                        self._process_get_url(url)
-                        return "input-success"
-                    except (UnsupportedOperation, EOFError, KeyboardInterrupt):
-                        pass
-                    except CancelledError:
-                        print(
-                            "Authentication completed via browser - input no longer needed."
-                        )
-                        pass
-                    return "input-failed"
-
-            logger.debug("step 3: waiting for SAML token")
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                futures = []
-
-                # Always expose a server
-                futures.append(executor.submit(server_task))
-
-                # Submit input task only if browser failed and input is available
-                if not browser_opened and sys.stdin.isatty():
-                    futures.append(executor.submit(input_task))
-
-                try:
-                    for future in as_completed(futures, timeout=120):
-                        result = future.result()
-                        if result and self._token:
-                            # We have a token, cancel the other task
-                            for f in futures:
-                                f.cancel()
-                            break
-                except TimeoutError:
-                    logger.debug("Authentication timed out")
-                except Exception as e:
-                    logger.debug(f"Exception during authentication: {e}")
+                    self._read_token_from_input(conn)
+                elif sys.stdin.isatty():
+                    # Headless Unix environment with a console, eg. `docker run -it` or SSH
+                    # We could get the token from a manually opened browser, OR input
+                    self._retrieve_saml_token_threaded(conn, socket_connection)
+                else:
+                    # Headless Unix environment with no console, eg. `docker run -e SF_AUTH_SOCKET_PORT`
+                    # Best we can hope is someone opens opens the browser from a log
+                    self._receive_saml_token(conn, socket_connection)
+            else:
+                # Browser opened, no need for console input
+                self._receive_saml_token(conn, socket_connection)
 
             if not self._token:
                 self._handle_failure(
@@ -253,6 +228,89 @@ class AuthByWebBrowser(AuthByPlugin):
     ) -> dict[str, bool]:
         conn.authenticate_with_retry(self)
         return {"success": True}
+
+    def _read_token_from_input(self, conn: SnowflakeConnection) -> None:
+        url = input("Enter the URL the SSO URL redirected you to: ")
+        self._process_get_url(url)
+        if not self._token:
+            # Input contained no token, either URL was incorrectly pasted,
+            # empty or just wrong
+            self._handle_failure(
+                conn=conn,
+                ret={
+                    "code": ER_UNABLE_TO_OPEN_BROWSER,
+                    "message": (
+                        "Unable to open a browser in this environment and "
+                        "SSO URL contained no token"
+                    ),
+                },
+            )
+
+    def _retrieve_saml_token_threaded(
+        self, conn: SnowflakeConnection, socket_connection
+    ) -> None:
+        def server_task():
+            time.sleep(100)
+            self._receive_saml_token(conn, socket_connection)
+            return "server-success"
+
+        def unix_nonblocking_input_task(cancel_event):
+            try:
+                print(
+                    "Enter the URL the SSO URL redirected you to: ",
+                    end="",
+                    flush=True,
+                )
+
+                url = ""
+                while True:
+                    if cancel_event.is_set():
+                        raise CancelledError()
+
+                    ready, _, _ = select.select([sys.stdin], [], [], 0.5)
+                    if ready:
+                        data = sys.stdin.read(BUF_SIZE)
+                        if "\n" in data:
+                            # Found newline, extract everything before it
+                            line_end = data.index("\n")
+                            url += data[:line_end]
+                            print(data[:line_end], end="", flush=True)
+                            break
+                        elif "\x03" in data:  # Ctrl+C
+                            raise KeyboardInterrupt()
+                        else:
+                            # No newline yet, add to buffer and continue
+                            url += data
+                            print(data, end="", flush=True)
+                            print("DOINGIGT")
+
+                self._process_get_url(url)
+                return "input-success"
+            except (UnsupportedOperation, EOFError, KeyboardInterrupt):
+                pass
+            except CancelledError:
+                print("Authentication completed via browser - input no longer needed.")
+                return "input-cancelled"
+            return "input-failed"
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = []
+
+            cancel_event = threading.Event()
+
+            # Always expose a server
+            futures.append(executor.submit(server_task))
+
+            futures.append(executor.submit(unix_nonblocking_input_task, cancel_event))
+
+            try:
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result and self._token:
+                        cancel_event.set()
+                        break
+            except Exception as e:
+                logger.debug(f"Exception during authentication: {e}")
 
     def _receive_saml_token(self, conn: SnowflakeConnection, socket_connection) -> None:
         """Receives SAML token from web browser."""
